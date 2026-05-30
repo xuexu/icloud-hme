@@ -128,6 +128,8 @@ flask>=3.0             # Web UI
 
 灌水 QQ 群：**1060714372**
 
+友情链接：[LINUX DO](https://linux.do/)
+
 ## License
 
 MIT
