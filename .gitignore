@@ -15,4 +15,4 @@ logs/
 results/
 cookies.json
 scheduler_state.json
-*.txt
+latest_emails.txt
