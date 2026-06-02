@@ -38,7 +38,7 @@ HERE = Path(__file__).resolve().parent
 if str(HERE) not in sys.path:
     sys.path.insert(0, str(HERE))
 
-from icloud_hme import ICloudHME, extract_chrome_cookies
+from account_manager import AccountManager
 
 # ============================================================
 # 配置
@@ -47,14 +47,6 @@ from icloud_hme import ICloudHME, extract_chrome_cookies
 LOG_DIR = HERE / "logs"
 RESULT_DIR = HERE / "results"
 STATE_FILE = HERE / "scheduler_state.json"
-
-# iCloud HME 已知上限相关错误关键词
-LIMIT_KEYWORDS = [
-    "limit", "exceeded", "maximum", "too many",
-    "无法创建", "已达上限", "超过限制", "quota",
-    "cannot create", "unavailable", "try again later",
-    "too many", "rate limit", "429",
-]
 
 
 # ============================================================
@@ -110,8 +102,30 @@ def save_state(state: Dict):
 
 
 # ============================================================
-# 上限检测
+# 核心: 一轮创建 (一直创建到上限)
 # ============================================================
+
+class CreateRound:
+    """一轮创建的结果 (多账号)"""
+
+    def __init__(self):
+        self.start_time = datetime.now()
+        self.end_time: Optional[datetime] = None
+        self.created: List[str] = []               # 成功创建的邮箱
+        self.created_by_account: Dict[str, int] = {}  # 按账号统计
+        self.errors: List[Dict] = []               # 失败记录
+        self.hit_limit = False                     # 是否触达上限
+        self.fatal_error: Optional[str] = None     # 致命错误
+
+
+# iCloud HME 已知上限相关错误关键词
+LIMIT_KEYWORDS = [
+    "limit", "exceeded", "maximum", "too many",
+    "无法创建", "已达上限", "超过限制", "quota",
+    "cannot create", "unavailable", "try again later",
+    "too many", "rate limit", "429",
+]
+
 
 def is_limit_error(error: str) -> bool:
     """判断错误是否由 iCloud 上限/配额触发"""
@@ -119,84 +133,106 @@ def is_limit_error(error: str) -> bool:
     return any(kw in lower for kw in LIMIT_KEYWORDS)
 
 
-# ============================================================
-# 核心: 一轮创建 (一直创建到上限)
-# ============================================================
-
-class CreateRound:
-    """一轮创建的结果"""
-
-    def __init__(self):
-        self.start_time = datetime.now()
-        self.end_time: Optional[datetime] = None
-        self.created: List[str] = []        # 成功创建的邮箱
-        self.errors: List[Dict] = []        # 失败记录
-        self.hit_limit = False              # 是否触达上限
-        self.fatal_error: Optional[str] = None  # 致命错误 (如cookie过期)
-
-
-def run_one_round(client: ICloudHME, logger: logging.Logger, label: str = "") -> CreateRound:
+def run_one_round(mgr: AccountManager, logger: logging.Logger,
+                  label: str = "", interval_sec: float = 3.0) -> CreateRound:
     """
-    执行一轮创建：一直创建到遇到上限错误为止。
+    执行一轮创建：遍历所有活跃账号，每个账号创建到上限为止。
     返回 CreateRound 包含本轮所有结果。
     """
     round_result = CreateRound()
-    consecutive_errors = 0
-    max_consecutive = 5  # 连续失败 N 次也视为上限/故障
+    accounts = mgr.list_accounts()
+    active_accounts = [a for a in accounts if a.get("status") == "active"]
 
-    logger.info(f"══════════ 新一轮开始 ══════════")
-    logger.info(f"开始创建，直到触发上限...")
+    if not active_accounts:
+        logger.warning("没有活跃账号，本轮跳过")
+        round_result.end_time = datetime.now()
+        return round_result
 
-    idx = 1
-    while True:
-        try:
-            alias_label = label or f"Batch {datetime.now().strftime('%m%d%H')}-{idx}"
-            result = client.create_alias(label=alias_label, max_retries=3)
-            email = result.get("email", "")
-            if email:
-                round_result.created.append(email)
-                consecutive_errors = 0
-                logger.info(f"  ✅ [{len(round_result.created)}] {email}")
-            else:
-                err_msg = "create_alias 返回空邮箱"
-                round_result.errors.append({"attempt": idx, "error": err_msg})
+    logger.info(f"══════════ 新一轮开始 ({len(active_accounts)} 个账号) ══════════")
+
+    for i, account in enumerate(active_accounts):
+        acc_id = account["id"]
+        acc_name = account.get("name", acc_id)
+        acc_email = account.get("real_email", "?")
+
+        logger.info(f"—— 账号 [{i+1}/{len(active_accounts)}] {acc_name} ({acc_email}) ——")
+
+        consecutive_errors = 0
+        max_consecutive = 5
+        idx = 1
+
+        while True:
+            try:
+                if consecutive_errors >= max_consecutive:
+                    logger.warning(f"  连续失败 {consecutive_errors} 次，切换下一个账号")
+                    break
+
+                # 使用 AccountManager 的创建方法（内置限流检测）
+                results = mgr.create_aliases_for_account(
+                    acc_id, count=1,
+                    label=label or f"{acc_name} {datetime.now().strftime('%m%d%H')}-{idx}",
+                )
+                if results and len(results) > 0:
+                    r = results[0]
+                    if r.get("ok") and r.get("email"):
+                        email = r["email"]
+                        round_result.created.append(email)
+                        round_result.created_by_account[acc_id] = \
+                            round_result.created_by_account.get(acc_id, 0) + 1
+                        consecutive_errors = 0
+                        logger.info(f"  ✅ [{sum(round_result.created_by_account.values())}] {email}")
+                    else:
+                        err_msg = r.get("error", "未知错误")
+                        round_result.errors.append({"account": acc_id, "attempt": idx, "error": err_msg})
+                        consecutive_errors += 1
+                        if is_limit_error(err_msg):
+                            logger.info(f"  🛑 触达上限: {err_msg[:120]}")
+                            break
+                        logger.warning(f"  ⚠️  [{idx}] {err_msg}")
+                else:
+                    consecutive_errors += 1
+                    logger.warning(f"  ⚠️  [{idx}] 空结果")
+
+            except Exception as e:
+                err_str = str(e)
+                round_result.errors.append({"account": acc_id, "attempt": idx, "error": err_str})
                 consecutive_errors += 1
-                logger.warning(f"  ⚠️  [{idx}] {err_msg}")
 
-        except Exception as e:
-            err_str = str(e)
-            round_result.errors.append({"attempt": idx, "error": err_str})
-            consecutive_errors += 1
+                if is_limit_error(err_str):
+                    logger.info(f"  🛑 触达上限: {err_str[:120]}")
+                    break
 
-            if is_limit_error(err_str):
-                logger.info(f"  🛑 触达上限: {err_str[:120]}")
-                round_result.hit_limit = True
-                break
+                if any(kw in err_str.lower() for kw in
+                       ["401", "403", "cookie", "session", "validate", "未开通"]):
+                    logger.error(f"  💀 账号 {acc_name} 致命错误: {err_str[:200]}")
+                    mgr.update_account(acc_id, status="error", last_error=err_str[:300])
+                    round_result.fatal_error = err_str
+                    break
 
-            # 致命错误: cookie 过期 / 未开通 iCloud+
-            if any(kw in err_str.lower() for kw in ["401", "403", "cookie", "session", "validate", "未开通"]):
-                logger.error(f"  💀 致命错误: {err_str[:200]}")
-                round_result.fatal_error = err_str
-                break
+                logger.warning(f"  ⚠️  [{idx}] 失败: {err_str[:100]}")
+                time.sleep(2)
 
-            if consecutive_errors >= max_consecutive:
-                logger.warning(f"  ⚠️  连续失败 {consecutive_errors} 次，本轮暂停")
-                round_result.hit_limit = True
-                break
+            idx += 1
 
-            logger.warning(f"  ⚠️  [{idx}] 失败: {err_str[:100]}")
-            time.sleep(2)  # 失败后短暂等待
+        # 账号间延迟
+        if i < len(active_accounts) - 1 and interval_sec > 0:
+            time.sleep(interval_sec)
 
-        idx += 1
-
+    round_result.hit_limit = any(
+        is_limit_error(e.get("error", ""))
+        for e in round_result.errors
+    )
     round_result.end_time = datetime.now()
     duration = (round_result.end_time - round_result.start_time).total_seconds()
 
+    summary = ", ".join(
+        f"{mgr.accounts[aid].get('name', aid)[:12]}: {n}"
+        for aid, n in round_result.created_by_account.items()
+    ) if round_result.created_by_account else "0"
+
     logger.info(
-        f"本轮结束: 创建 {len(round_result.created)} 个, "
-        f"失败 {len(round_result.errors)} 次, "
-        f"耗时 {duration:.0f}s, "
-        f"状态: {'触达上限' if round_result.hit_limit else '致命错误' if round_result.fatal_error else '正常结束'}"
+        f"本轮结束: 创建 {len(round_result.created)} 个 ({summary}), "
+        f"失败 {len(round_result.errors)} 次, 耗时 {duration:.0f}s"
     )
     return round_result
 
@@ -222,24 +258,14 @@ def save_round_result(round_result: CreateRound, logger: logging.Logger):
     logger.debug(f"结果已保存: {result_file.name}")
 
 
-def save_latest_emails(round_result: CreateRound, logger: logging.Logger):
-    """追加新创建的邮箱到 latest.txt"""
-    if round_result.created:
-        latest_file = RESULT_DIR / "latest_emails.txt"
-        with open(str(latest_file), "a", encoding="utf-8") as f:
-            for email in round_result.created:
-                f.write(f"{email}\n")
-        logger.debug(f"已追加 {len(round_result.created)} 个邮箱到 latest_emails.txt")
-
-
 # ============================================================
 # 等待到下一个触发点
 # ============================================================
 
-def wait_until_next_hour(logger: logging.Logger):
-    """计算并休眠到下一个整点 (固定目标，避免边界漂移)"""
-    target = datetime.now().replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
-    logger.info(f"下一轮触发: {target.strftime('%H:%M:%S')} (等待 {(target - datetime.now()).total_seconds()/60:.1f} 分钟)")
+def wait_interval(logger: logging.Logger, seconds: float = 3600):
+    """休眠指定秒数 (默认 1 小时)，可中断退出。"""
+    target = datetime.now() + timedelta(seconds=seconds)
+    logger.info(f"下一轮触发: {target.strftime('%H:%M:%S')} (等待 {seconds/60:.0f} 分钟)")
     logger.info(f"休眠中... (Ctrl+C 退出)")
 
     while True:
@@ -254,18 +280,18 @@ def wait_until_next_hour(logger: logging.Logger):
 # ============================================================
 
 class Scheduler:
-    """iCloud HME 定时调度器"""
+    """iCloud HME 定时调度器 (多账号)"""
 
     def __init__(
         self,
-        cookies: Dict[str, str],
-        host: str = "icloud.com",
+        mgr: AccountManager,
         label_prefix: str = "",
+        interval_sec: float = 3.0,
         verbose: bool = True,
     ):
-        self.cookies = cookies
-        self.host = host
+        self.mgr = mgr
         self.label_prefix = label_prefix
+        self.interval_sec = interval_sec
         self.verbose = verbose
         self.logger = setup_logging(verbose)
         self._running = True
@@ -279,15 +305,17 @@ class Scheduler:
         self.logger.info(f"收到退出信号 (signal={signum})，等当前轮次完成后退出...")
         self._running = False
 
-    def _make_client(self) -> ICloudHME:
-        return ICloudHME(self.cookies, host=self.host, verbose=self.verbose)
-
     def run(self):
         """主循环"""
+        summary = self.mgr.get_summary()
         self.logger.info("=" * 55)
-        self.logger.info("iCloud HME 定时调度器 启动")
+        self.logger.info("iCloud HME 多账号定时调度器 启动")
+        self.logger.info(f"账号数: {summary['account_count']} "
+                         f"(活跃: {summary['active_accounts']}, "
+                         f"异常: {summary['error_accounts']})")
         self.logger.info(f"累计已创建: {self._state.get('total_created', 0)} 个")
-        self.logger.info(f"触发模式: 每整点自动一轮，每轮创建到上限")
+        self.logger.info(f"触发模式: 每整点自动一轮，每轮遍历所有账号到上限")
+        self.logger.info(f"账号间间隔: {self.interval_sec}s")
         self.logger.info(f"日志目录: {LOG_DIR}")
         self.logger.info(f"结果目录: {RESULT_DIR}")
         self.logger.info("=" * 55)
@@ -297,25 +325,29 @@ class Scheduler:
         while self._running:
             round_num += 1
             now = datetime.now()
-            label = f"{self.label_prefix}R{round_num} {now.strftime('%m%d%H%M')}" if self.label_prefix else f"Round {round_num} {now.strftime('%m%d%H%M')}"
+            label = (f"{self.label_prefix}R{round_num} {now.strftime('%m%d%H%M')}"
+                     if self.label_prefix else f"R{round_num} {now.strftime('%m%d%H%M')}")
 
-            # 执行一轮
-            client = self._make_client()
-            round_result = run_one_round(client, self.logger, label=label)
+            # 执行一轮（遍历所有活跃账号）
+            round_result = run_one_round(
+                self.mgr, self.logger, label=label,
+                interval_sec=self.interval_sec,
+            )
 
             # 保存结果
             save_round_result(round_result, self.logger)
-            save_latest_emails(round_result, self.logger)
 
             # 更新状态
-            self._state["total_created"] = self._state.get("total_created", 0) + len(round_result.created)
+            self._state["total_created"] = (
+                self._state.get("total_created", 0) + len(round_result.created)
+            )
             self._state["rounds"].append({
                 "round": round_num,
                 "time": now.isoformat(),
                 "created": len(round_result.created),
+                "by_account": round_result.created_by_account,
                 "hit_limit": round_result.hit_limit,
             })
-            # 只保留最近 200 轮记录
             if len(self._state["rounds"]) > 200:
                 self._state["rounds"] = self._state["rounds"][-200:]
             self._state["last_error"] = round_result.fatal_error
@@ -323,17 +355,21 @@ class Scheduler:
 
             # 致命错误 → 退出
             if round_result.fatal_error:
-                self.logger.error(f"致命错误，调度器退出: {round_result.fatal_error[:200]}")
+                self.logger.error(
+                    f"致命错误，调度器退出: {round_result.fatal_error[:200]}"
+                )
                 self._running = False
                 break
 
             if not self._running:
                 break
 
-            # 等待到下一个整点
-            wait_until_next_hour(self.logger)
+            # 等待 1 小时
+            wait_interval(self.logger, 3600)
 
-        self.logger.info(f"调度器已停止。累计创建: {self._state.get('total_created', 0)} 个")
+        self.logger.info(
+            f"调度器已停止。累计创建: {self._state.get('total_created', 0)} 个"
+        )
         save_state(self._state)
 
 
@@ -343,57 +379,44 @@ class Scheduler:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="iCloud HME 定时调度器 — 每整点自动创建隐私邮箱到上限",
+        description="iCloud HME 多账号定时调度器 — 每整点遍历所有账号创建到上限",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("--cookies", "-c", type=str, help="cookies.json 路径 (默认从Chrome自动提取)")
-    parser.add_argument("--host", type=str, default="icloud.com",
-                       choices=["icloud.com", "icloud.com.cn"])
+    parser.add_argument("--interval", "-i", type=float, default=3.0,
+                       help="账号间间隔秒数 (默认 3.0)")
     parser.add_argument("--label", type=str, default="", help="别名标签前缀")
     parser.add_argument("--quiet", "-q", action="store_true", help="减少控制台输出")
     parser.add_argument("--daemon", "-d", action="store_true", help="后台运行 (Windows 不支持)")
 
     args = parser.parse_args()
 
-    # 加载 cookies
-    if args.cookies:
-        if not os.path.isfile(args.cookies):
-            print(f"[!] Cookie 文件不存在: {args.cookies}")
-            sys.exit(1)
-        with open(args.cookies, "r", encoding="utf-8") as f:
-            cookies = json.load(f)
-        print(f"[+] 从文件加载 {len(cookies)} 个 cookie")
-    else:
-        print("[*] 从 Chrome 自动提取 iCloud cookies...")
-        try:
-            cookies = extract_chrome_cookies()
-        except RuntimeError as e:
-            print(f"[!] {e}")
-            sys.exit(1)
-        if not cookies:
-            print("[!] 未提取到 iCloud cookies，请先登录 icloud.com")
-            sys.exit(1)
-        print(f"[+] 已提取 {len(cookies)} 个 cookie")
+    # 使用 AccountManager
+    mgr = AccountManager()
+    summary = mgr.get_summary()
+    if summary["active_accounts"] == 0:
+        print("[!] 没有活跃账号。请先通过 Web UI 添加账号，或确保 accounts.json 中有活跃账号。")
+        sys.exit(1)
+
+    print(f"[+] 加载 {summary['account_count']} 个账号 "
+          f"(活跃: {summary['active_accounts']}, 异常: {summary['error_accounts']})")
 
     # 后台运行 (仅 Linux/macOS)
     if args.daemon:
         if sys.platform == "win32":
             print("[!] Windows 不支持 --daemon，请使用 pythonw 或 NSSM 注册服务")
             sys.exit(1)
-        # fork 守护进程
         pid = os.fork()
         if pid > 0:
             print(f"[+] 守护进程已启动 (PID={pid})")
             sys.exit(0)
-        # 子进程
         os.setsid()
         os.umask(0)
 
     # 启动调度器
     scheduler = Scheduler(
-        cookies=cookies,
-        host=args.host,
+        mgr=mgr,
         label_prefix=args.label,
+        interval_sec=args.interval,
         verbose=not args.quiet,
     )
 
