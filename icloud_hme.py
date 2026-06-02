@@ -229,6 +229,7 @@ class ICloudHME:
         self.session.cookies.update(cookies)
         self._setup_url: Optional[str] = None
         self._service_url: Optional[str] = None
+        self._account_info: Optional[Dict] = None
 
     # ---- 内部 ----
 
@@ -307,7 +308,7 @@ class ICloudHME:
     # ---- 会话 ----
 
     def validate_session(self) -> Dict:
-        """校验 iCloud 会话，获取 Hide My Email 服务端点"""
+        """校验 iCloud 会话，获取 Hide My Email 服务端点及账号身份"""
         self._log("校验 iCloud 会话...")
         data = self._request("POST", f"{self.setup_url}/validate", timeout=20)
         premium = data.get("webservices", {}).get("premiummailsettings", {})
@@ -319,8 +320,30 @@ class ICloudHME:
                 "  3. 网络问题"
             )
         self._service_url = premium["url"].rstrip("/")
-        self._log(f"会话有效 → 服务端点已获取")
+
+        # 提取账号身份信息
+        ds_info = data.get("dsInfo", {})
+        self._account_info = {
+            "dsid": str(ds_info.get("dsid", "")),
+            "appleId": str(ds_info.get("appleId", "") or ds_info.get("primaryEmail", "") or ds_info.get("appleIdEmail", "")),
+            "primaryEmail": str(ds_info.get("primaryEmail", "") or ds_info.get("appleId", "")),
+            "fullName": str(ds_info.get("fullName", "") or ds_info.get("name", "")),
+            "isManagedAppleId": bool(ds_info.get("isManagedAppleId", False)),
+        }
+        if not self._account_info["appleId"]:
+            # fallback: 从 cookie 推断
+            for name in ("aosappleid", "appleId", "dsid"):
+                if name in self.cookies:
+                    self._account_info["appleId"] = str(self.cookies[name])
+                    break
+
+        self._log(f"会话有效 → {self._account_info.get('appleId', '未知账号')}")
         return data
+
+    def get_account_info(self) -> Optional[Dict]:
+        """返回账号身份信息，需先调用 validate_session()。
+        返回: {dsid, appleId, primaryEmail, fullName, isManagedAppleId} 或 None"""
+        return self._account_info
 
     def _resolve_service(self):
         if not self._service_url:
@@ -617,7 +640,7 @@ def main():
     # ---- export-cookies ----
     p_exp = sub.add_parser("export-cookies", help="导出 Chrome cookies")
     p_exp.add_argument("-o", "--output", default="icloud_cookies.json", help="输出路径")
-    _add_common_args(p_exp)  # 允许 --cookies 但不强制
+    _add_common_args(p_exp)
 
     args = parser.parse_args()
 
